@@ -1,5 +1,7 @@
 package vanh.notify.controller;
 
+import org.springframework.data.redis.core.Cursor;
+import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.ResponseEntity;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -16,6 +18,7 @@ public class NotifyController {
 
     private final StringRedisTemplate redisTemplate;
     private final KafkaTemplate<String, NotifyJob> kafkaTemplate;
+    private static final int BATCH_SIZE = 1000; // Kích thước batch cho Redis SCAN
 
     public NotifyController(StringRedisTemplate redisTemplate,
                             KafkaTemplate<String, NotifyJob> kafkaTemplate) {
@@ -28,7 +31,7 @@ public class NotifyController {
         Long channelId = request.getChannelId();
         Long categoryId = request.getCategoryId();
 
-        // 1. Find all Redis shard keys
+        // 1. Tìm tất cả Redis keys shard
         String keyPattern = String.format("sub:C%d_CAT%d:*", channelId, categoryId);
         Set<String> keys = redisTemplate.keys(keyPattern);
 
@@ -36,43 +39,47 @@ public class NotifyController {
             return ResponseEntity.ok(Collections.singletonMap("status", "NO_SUBSCRIBERS"));
         }
 
-        // 2. Get all user IDs from shards
-        Set<String> allUserIds = new HashSet<>();
+        // 2. Duyệt qua từng shard và xử lý streaming
         for (String key : keys) {
-            Set<String> userIds = redisTemplate.opsForSet().members(key);
-            if (userIds != null) {
-                allUserIds.addAll(userIds);
-            }
-        }
-
-        // 3. Partition into chunks of 500 users
-        List<List<String>> chunks = partition(new ArrayList<>(allUserIds), 500);
-
-        // 4. Push each chunk to Kafka
-        for (List<String> chunk : chunks) {
-            NotifyJob job = new NotifyJob(
-                    chunk,
-                    request.getTitle(),
-                    request.getContent(),
-                    request.getAdditionalInfo(),
-                    channelId,
-                    categoryId
-            );
-            kafkaTemplate.send("notify_jobs", job);
+            processRedisSet(request, key, channelId, categoryId);
         }
 
         return ResponseEntity.ok(Collections.singletonMap("status", "QUEUED"));
     }
 
-    private <T> List<List<T>> partition(List<T> list, int size) {
-        List<List<T>> partitions = new ArrayList<>();
-        for (int i = 0; i < list.size(); i += size) {
-            partitions.add(list.subList(i, Math.min(i + size, list.size())));
+    private void processRedisSet(NotifyRequest request, String key, Long channelId, Long categoryId) {
+        ScanOptions scanOptions = ScanOptions.scanOptions().count(BATCH_SIZE).build();
+        try (Cursor<String> cursor = redisTemplate.opsForSet().scan(key, scanOptions)) {
+
+            List<String> currentBatch = new ArrayList<>(BATCH_SIZE);
+
+            while (cursor.hasNext()) {
+                String userId = cursor.next();
+                currentBatch.add(userId);
+
+                // Khi đủ batch size, gửi vào Kafka
+                if (currentBatch.size() >= BATCH_SIZE) {
+                    sendToKafka(request, currentBatch, channelId, categoryId);
+                    currentBatch.clear();
+                }
+            }
+
+            // Gửi phần còn lại
+            if (!currentBatch.isEmpty()) {
+                sendToKafka(request, currentBatch, channelId, categoryId);
+            }
         }
-        return partitions;
+    }
+
+    private void sendToKafka(NotifyRequest request, List<String> userIds, Long channelId, Long categoryId) {
+        NotifyJob job = new NotifyJob(
+                userIds,
+                request.getTitle(),
+                request.getContent(),
+                request.getAdditionalInfo(),
+                channelId,
+                categoryId
+        );
+        kafkaTemplate.send("notify_jobs", job);
     }
 }
-
-// DTO Classes
-
-
